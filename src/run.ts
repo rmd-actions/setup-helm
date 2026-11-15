@@ -5,12 +5,15 @@ import * as os from 'os'
 import * as path from 'path'
 import * as util from 'util'
 import * as fs from 'fs'
+import {createHash} from 'crypto'
 
 import * as toolCache from '@actions/tool-cache'
 import * as core from '@actions/core'
 
 const helmToolName = 'helm'
-export const stableHelmVersion = 'v3.18.4'
+export const stableHelmVersion = 'v4.3.1'
+
+export type ChecksumPolicy = 'auto' | 'required' | 'if-available' | 'disabled'
 
 export async function run() {
    let version = core.getInput('version')
@@ -32,11 +35,34 @@ export async function run() {
    }
 
    const downloadBaseURL = core.getInput('downloadBaseURL', {required: false})
+   const downloadBaseURLFallback = core.getInput('downloadBaseURLFallback', {
+      required: false
+   })
+   const checksumPolicy = getChecksumPolicy(
+      core.getInput('checksum-policy', {required: false})
+   )
 
    if (version.toLocaleLowerCase() === 'latest') {
-      version = await getLatestHelmVersion()
+      // Only an explicit 'false' turns the fallback off, matching the
+      // input's default.
+      const fallbackToDefault =
+         core.getInput('latest-fallback').toLowerCase() !== 'false'
+      version = await getLatestHelmVersion(fallbackToDefault)
    } else if (isMajorMinorShaped(version)) {
-      version = await resolveLatestPatchVersion(downloadBaseURL, version)
+      try {
+         version = await resolveLatestPatchVersion(downloadBaseURL, version)
+      } catch (error) {
+         if (!downloadBaseURLFallback) {
+            throw error
+         }
+         core.warning(
+            `Unable to resolve the latest Helm patch from '${downloadBaseURL}': ${error instanceof Error ? error.message : String(error)}. Trying fallback '${downloadBaseURLFallback}'`
+         )
+         version = await resolveLatestPatchVersion(
+            downloadBaseURLFallback,
+            version
+         )
+      }
       core.info(`Resolved latest patch Helm version to '${version}'`)
    } else if (version[0] !== 'v') {
       version = getValidVersion(version)
@@ -44,7 +70,12 @@ export async function run() {
    }
 
    core.startGroup(`Installing ${version}`)
-   const cachedPath = await downloadHelm(downloadBaseURL, version)
+   const cachedPath = await downloadHelm(
+      downloadBaseURL,
+      version,
+      downloadBaseURLFallback,
+      checksumPolicy
+   )
    core.endGroup()
 
    try {
@@ -62,6 +93,21 @@ export async function run() {
 // Prefixes version with v
 export function getValidVersion(version: string): string {
    return 'v' + version
+}
+
+export function getChecksumPolicy(value: string): ChecksumPolicy {
+   const policy = value.trim().toLowerCase() || 'auto'
+   if (
+      policy !== 'auto' &&
+      policy !== 'required' &&
+      policy !== 'if-available' &&
+      policy !== 'disabled'
+   ) {
+      throw new Error(
+         `Invalid checksum-policy '${value}'. Expected auto, required, if-available, or disabled`
+      )
+   }
+   return policy
 }
 
 // Matches a complete semantic version (major.minor.patch with optional
@@ -122,15 +168,61 @@ export function parseToolVersions(content: string): string {
    return ''
 }
 
-// Gets the latest helm version or returns a default stable if getting latest fails
-export async function getLatestHelmVersion(): Promise<string> {
+const latestVersionURL = 'https://get.helm.sh/helm-latest-version'
+
+// Number of attempts made to fetch the latest version before giving up, and
+// the wait before the second attempt (each further wait doubles the previous).
+const latestVersionAttempts = 3
+const latestVersionRetryDelayMs = 1000
+
+// Fetches the latest helm version. A failed request or a non-2xx response is
+// retried with a short backoff, so a single transient failure does not decide
+// the outcome. Throws the last error once every attempt has failed.
+export async function fetchLatestHelmVersion(): Promise<string> {
+   let delayMs = latestVersionRetryDelayMs
+   for (let attempt = 1; ; attempt++) {
+      try {
+         const response = await fetch(latestVersionURL)
+         if (!response.ok) {
+            // The body is never read, so cancel it to release the connection
+            // before the next attempt.
+            await response.body?.cancel()
+            throw new Error(
+               `Unexpected HTTP ${response.status} from ${latestVersionURL}`
+            )
+         }
+         return (await response.text()).trim()
+      } catch (err) {
+         if (attempt >= latestVersionAttempts) {
+            throw err
+         }
+         core.info(
+            `Attempt ${attempt} of ${latestVersionAttempts} to fetch the latest Helm version failed: ${err instanceof Error ? err.message : String(err)}. Retrying in ${delayMs}ms`
+         )
+         await new Promise((resolve) => setTimeout(resolve, delayMs))
+         delayMs *= 2
+      }
+   }
+}
+
+// Gets the latest helm version. When it cannot be determined, returns the
+// built-in default version with a warning, or throws when fallbackToDefault
+// is off. The default version can be a major behind what 'latest' resolves
+// to, so the warning names the input that turns the fallback off.
+export async function getLatestHelmVersion(
+   fallbackToDefault = true
+): Promise<string> {
    try {
-      const response = await fetch('https://get.helm.sh/helm-latest-version')
-      const release = (await response.text()).trim()
-      return release
+      return await fetchLatestHelmVersion()
    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      if (!fallbackToDefault) {
+         throw new Error(
+            `Unable to determine the latest Helm version: ${message}. Set 'latest-fallback' to 'true' to install the default version ${stableHelmVersion} instead, or request a specific version`
+         )
+      }
       core.warning(
-         `Error while fetching latest Helm release: ${err instanceof Error ? err.message : String(err)}. Using default version ${stableHelmVersion}`
+         `Error while fetching latest Helm release: ${message}. Using default version ${stableHelmVersion}. Set 'latest-fallback' to 'false' to fail the step instead`
       )
       return stableHelmVersion
    }
@@ -286,9 +378,76 @@ export function getHelmDownloadURL(baseURL: string, version: string): string {
    return url.toString()
 }
 
+export async function downloadAndVerifyHelm(
+   baseURL: string,
+   version: string,
+   policy: ChecksumPolicy = 'auto'
+): Promise<string> {
+   const downloadURL = getHelmDownloadURL(baseURL, version)
+   const effectivePolicy = resolveChecksumPolicy(policy)
+
+   if (effectivePolicy === 'disabled') {
+      core.warning(
+         `Checksum verification is disabled for Helm downloads from '${baseURL}'`
+      )
+      return toolCache.downloadTool(downloadURL)
+   }
+
+   let checksum: string | undefined
+   try {
+      const checksumPath = await toolCache.downloadTool(`${downloadURL}.sha256`)
+      checksum = fs.readFileSync(checksumPath, 'utf8').trim()
+   } catch (error) {
+      if (
+         effectivePolicy === 'if-available' &&
+         isChecksumNotFoundError(error)
+      ) {
+         core.warning(
+            `No SHA-256 checksum is available for ${downloadURL}; continuing without verification. Set checksum-policy to 'required' to fail instead.`
+         )
+         return toolCache.downloadTool(downloadURL)
+      }
+      throw error
+   }
+
+   if (!/^[a-fA-F0-9]{64}$/.test(checksum)) {
+      throw new Error(`Invalid SHA-256 checksum from ${downloadURL}.sha256`)
+   }
+
+   const archivePath = await toolCache.downloadTool(downloadURL)
+   const hash = createHash('sha256')
+   await new Promise<void>((resolve, reject) => {
+      const archive = fs.createReadStream(archivePath)
+      archive.on('data', (chunk) => hash.update(chunk))
+      archive.on('error', reject)
+      archive.on('end', resolve)
+   })
+   const actual = hash.digest('hex')
+   if (actual.toLowerCase() !== checksum.toLowerCase()) {
+      throw new Error(`SHA-256 checksum mismatch for ${downloadURL}`)
+   }
+
+   return archivePath
+}
+
+export function resolveChecksumPolicy(
+   policy: ChecksumPolicy
+): Exclude<ChecksumPolicy, 'auto'> {
+   return policy === 'auto' ? 'if-available' : policy
+}
+
+function isChecksumNotFoundError(error: unknown): boolean {
+   return (
+      error instanceof toolCache.HTTPError &&
+      (error.httpStatusCode === 404 || error.httpStatusCode === 410)
+   )
+}
+
 export async function downloadHelm(
    baseURL: string,
-   version: string
+   version: string,
+   fallbackBaseURL?: string,
+   checksumPolicy: ChecksumPolicy = 'auto'
 ): Promise<string> {
    let cachedToolpath = toolCache.find(helmToolName, version)
    if (cachedToolpath) {
@@ -297,15 +456,40 @@ export async function downloadHelm(
       core.info(`Downloading '${version}' from '${baseURL}'`)
       let helmDownloadPath
       try {
-         helmDownloadPath = await toolCache.downloadTool(
-            getHelmDownloadURL(baseURL, version)
+         helmDownloadPath = await downloadAndVerifyHelm(
+            baseURL,
+            version,
+            checksumPolicy
          )
-      } catch (exception) {
+      } catch (error) {
+         if (fallbackBaseURL) {
+            core.warning(
+               `Unable to download and verify Helm from '${baseURL}': ${error instanceof Error ? error.message : String(error)}. Trying fallback '${fallbackBaseURL}'`
+            )
+            try {
+               helmDownloadPath = await downloadAndVerifyHelm(
+                  fallbackBaseURL,
+                  version,
+                  checksumPolicy
+               )
+            } catch (fallbackError) {
+               throw new Error(
+                  `Failed to download and verify Helm from '${baseURL}' and fallback '${fallbackBaseURL}': ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`
+               )
+            }
+         } else {
+            throw new Error(
+               `Failed to download and verify Helm from location ${getHelmDownloadURL(
+                  baseURL,
+                  version
+               )}: ${error instanceof Error ? error.message : String(error)}`
+            )
+         }
+      }
+
+      if (!helmDownloadPath) {
          throw new Error(
-            `Failed to download Helm from location ${getHelmDownloadURL(
-               baseURL,
-               version
-            )}`
+            `Failed to download and verify Helm version '${version}'`
          )
       }
 
